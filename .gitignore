@@ -1,0 +1,15 @@
+# Ignore Data
+data/
+*.zip
+*.tar.gz
+*.pth
+*.pt
+
+# Ignore Environment
+env/
+ssl_project/
+.ipynb_checkpoints/
+__pycache__/
+
+# Ignore OS files
+.DS_Store
