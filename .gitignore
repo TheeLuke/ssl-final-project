@@ -1,9 +1,13 @@
 # Ignore Data
-data/
 *.zip
 *.tar.gz
 *.pth
 *.pt
+
+# IGNORE DATASETS
+data/
+fall2025_deeplearning/
+cc3m_all/
 
 # Ignore Environment
 env/
