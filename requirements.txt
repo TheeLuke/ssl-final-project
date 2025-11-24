@@ -1,0 +1,12 @@
+# Core DL Libraries
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch
+torchvision
+torchaudio
+
+# Data & Utilities
+datasets
+scikit-learn
+tqdm
+matplotlib
+numpy
