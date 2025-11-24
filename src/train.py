@@ -43,7 +43,7 @@ class NTXentLoss(nn.Module):
         
         # Mask out self-similarity (similarity of image with itself)
         mask = torch.eye(labels.shape[0], dtype=torch.bool).to(z.device)
-        similarity_matrix = similarity_matrix.masked_fill(mask, -9e15)
+        similarity_matrix = similarity_matrix.masked_fill(mask, float('-inf'))
         
         # Compute Cross Entropy
         loss = F.cross_entropy(similarity_matrix, labels)
