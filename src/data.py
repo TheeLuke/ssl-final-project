@@ -77,25 +77,32 @@ def get_dataloaders(dataset_name='cifar10', batch_size=256, num_workers=4):
     # --- B. Competition Mode (Hugging Face) ---
     elif dataset_name == 'project_data':
         import os
+        from glob import glob
+        from PIL import Image
         
         memory_dataset = None
         test_dataset = None
-        
-        # Path to where you unzipped the images
-        # Ensure this path matches where you ran the unzip command
-        traindir = '../data/cc3m_all' 
-        
-        if not os.path.exists(traindir):
-            raise FileNotFoundError(f"Cannot find training data at {traindir}")
 
-        # ImageFolder expects structure like: root/class_x/image.png
-        # If your unzip dumped all images into one folder without subfolders,
-        # we might need a custom dataset. 
-        # Assuming standard ImageFolder structure (root/images/...):
+
+        # --- NEW SPEED OPTIMIZATION LOGIC ---
+        # Check if we are running on a Slurm node with local data
+        slurm_tmp = os.environ.get('SLURM_TMPDIR')
         
-        # If the unzip created a flat folder of images, we need a custom class:
-        from glob import glob
-        from PIL import Image
+        # If the fast local folder exists and has data, use it!
+        if slurm_tmp and os.path.exists(os.path.join(slurm_tmp, 'data', 'cc3m_all')):
+            print(f"🚀 DETECTED FAST LOCAL DRIVE: Using data from {slurm_tmp}")
+            traindir = os.path.join(slurm_tmp, 'data', 'cc3m_all')
+        else:
+            # Fallback to slow network storage (for testing)
+            print("Using slow network storage (or local dev path)...")
+            traindir = './data/cc3m_all' 
+        # ------------------------------------
+
+        if not os.path.exists(traindir):
+             # Try going up one level if running from src/
+             traindir = '../data/cc3m_all'
+             if not os.path.exists(traindir):
+                raise FileNotFoundError(f"Cannot find training data. Tried: {traindir}")
 
         class FlatFolderDataset(Dataset):
             def __init__(self, root, transform=None, cache_file="data_cache.pth"):
