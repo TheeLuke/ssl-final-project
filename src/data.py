@@ -98,33 +98,50 @@ def get_dataloaders(dataset_name='cifar10', batch_size=256, num_workers=4):
         from PIL import Image
 
         class FlatFolderDataset(Dataset):
-            def __init__(self, root, transform=None):
+            def __init__(self, root, transform=None, cache_file="data_cache.pth"):
                 self.root = root
-                # 1. Look for specific image extensions only
-                # 2. Use recursive search (**) in case images are in subfolders
-                self.files = []
-                for ext in ["*.jpg", "*.jpeg", "*.png"]:
-                     # recursive=True finds images even if they are inside 'train/'
-                    self.files.extend(glob(os.path.join(root, "**", ext), recursive=True))
-                
-                # Sort to ensure consistent order across runs
-                self.files.sort()
-                
-                print(f"Found {len(self.files)} images in {root}")
-                if len(self.files) == 0:
-                    raise FileNotFoundError(f"No images found in {root}. Check your path!")
-                    
                 self.transform = transform
+                
+                # Absolute path for the cache file so it saves in the root
+                cache_path = os.path.abspath(cache_file)
+                
+                # 1. Check if cache exists
+                if os.path.exists(cache_path):
+                    print(f"Loading cached file list from {cache_path}...")
+                    # This takes 0.5 seconds instead of 10 minutes
+                    self.files = torch.load(cache_path)
+                    
+                # 2. If not, scan and save
+                else:
+                    print(f"Scanning {root}... (This will take time, but only once!)")
+                    self.files = []
+                    # Scan for images
+                    for ext in ["*.jpg", "*.jpeg", "*.png"]:
+                        self.files.extend(glob(os.path.join(root, "**", ext), recursive=True))
+                    
+                    self.files.sort()
+                    
+                    if len(self.files) > 0:
+                        print(f"Saving cache to {cache_path}...")
+                        torch.save(self.files, cache_path)
+                    else:
+                        raise FileNotFoundError(f"No images found in {root}")
+
+                print(f"Dataset size: {len(self.files)}")
 
             def __len__(self):
                 return len(self.files)
 
             def __getitem__(self, idx):
-                # Now we are guaranteed to open a file, not a folder
-                img = Image.open(self.files[idx]).convert('RGB')
-                if self.transform:
-                    img = self.transform(img)
-                return img, 0
+                try:
+                    img = Image.open(self.files[idx]).convert('RGB')
+                    if self.transform:
+                        img = self.transform(img)
+                    return img, 0 
+                except Exception as e:
+                    # Skip corrupted images instead of crashing
+                    print(f"Error loading {self.files[idx]}: {e}")
+                    return torch.zeros(3, 96, 96), 0
 
         train_dataset = FlatFolderDataset(traindir, transform=SSLTransform(size=96))
         
