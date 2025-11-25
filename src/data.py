@@ -134,14 +134,22 @@ def get_dataloaders(dataset_name='cifar10', batch_size=256, num_workers=4):
 
             def __getitem__(self, idx):
                 try:
-                    img = Image.open(self.files[idx]).convert('RGB')
+                    path = self.files[idx]
+                    # Force the file to open and load pixel data immediately
+                    img = Image.open(path).convert('RGB')
+                    
                     if self.transform:
                         img = self.transform(img)
                     return img, 0 
+                    
                 except Exception as e:
-                    # Skip corrupted images instead of crashing
-                    print(f"Error loading {self.files[idx]}: {e}")
-                    return torch.zeros(3, 96, 96), 0
+                    # If ANY error happens (corrupt file, truncated, etc.)
+                    print(f"⚠️ WARNING: Corrupted image found at {self.files[idx]}. Skipping...")
+                    
+                    # Recursively return the next image instead of crashing
+                    # We use (idx + 1) to try the very next neighbor
+                    new_idx = (idx + 1) % len(self.files)
+                    return self.__getitem__(new_idx)
 
         train_dataset = FlatFolderDataset(traindir, transform=SSLTransform(size=96))
         
