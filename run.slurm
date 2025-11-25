@@ -10,8 +10,6 @@
 #SBATCH --error=slurm_%j.err
 
 # 1. Environment Setup
-module purge
-module load anaconda3/2024.02
 source activate ssl_project
 
 # 2. Fast Data Copy to SSD (Crucial for Speed)
