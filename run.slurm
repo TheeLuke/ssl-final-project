@@ -1,32 +1,29 @@
 #!/bin/bash
 #SBATCH --job-name=ssl_resnet18
-#SBATCH --nodes=1
-#SBATCH --gres=gpu:1
+#SBATCH --account=csci_ga_2572-2025fa     <-- YOUR CLASS ACCOUNT 
+#SBATCH --partition=c12m85-a100-1         <-- A100 GPU Partition [cite: 83, 94]
+#SBATCH --gres=gpu:1                      <-- Request 1 GPU
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32GB
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00                   <-- Reduced to 12h (Spot instances are often capped)
+#SBATCH --requeue                         <-- REQUIRED: Auto-restart if Google interrupts you 
 #SBATCH --output=slurm_%j.out
 #SBATCH --error=slurm_%j.err
 
 # 1. Environment Setup
-source activate dl_env
+module purge
+module load anaconda3/2024.02
+source activate ssl_project
 
-# 2. Fast Data Copy (The "Pro" Move)
-# This copies data from slow /scratch to the fast local SSD ($SLURM_TMPDIR)
+# 2. Fast Data Copy to SSD (Crucial for Speed)
 echo "Step 1: Copying data to local SSD ($SLURM_TMPDIR)..."
 mkdir -p $SLURM_TMPDIR/data
-
-# Unzip directly to the fast drive
-unzip -q -o "../data/cc3m_all/*.zip" -d $SLURM_TMPDIR/data/cc3m_all
-
-echo "Step 2: Data copy finished. Files in SSD:"
-ls $SLURM_TMPDIR/data/cc3m_all | head -n 5
+# Update this path if your zips are elsewhere!
+unzip -q -o "./data/cc3m_all/*.zip" -d $SLURM_TMPDIR/data/cc3m_all
 
 # 3. Run Training
-# We add the root folder to python path so it finds 'src'
 export PYTHONPATH=$PYTHONPATH:$(pwd)
+echo "Step 2: Starting Training..."
 
-echo "Step 3: Starting Training..."
 python src/train.py \
     --dataset project_data \
     --arch resnet18 \
