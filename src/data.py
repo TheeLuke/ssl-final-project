@@ -78,6 +78,9 @@ def get_dataloaders(dataset_name='cifar10', batch_size=256, num_workers=4):
     elif dataset_name == 'project_data':
         import os
         
+        memory_dataset = None
+        test_dataset = None
+        
         # Path to where you unzipped the images
         # Ensure this path matches where you ran the unzip command
         traindir = '../data/cc3m_all' 
@@ -97,14 +100,31 @@ def get_dataloaders(dataset_name='cifar10', batch_size=256, num_workers=4):
         class FlatFolderDataset(Dataset):
             def __init__(self, root, transform=None):
                 self.root = root
-                self.files = glob(os.path.join(root, "*")) # Get all files
+                # 1. Look for specific image extensions only
+                # 2. Use recursive search (**) in case images are in subfolders
+                self.files = []
+                for ext in ["*.jpg", "*.jpeg", "*.png"]:
+                     # recursive=True finds images even if they are inside 'train/'
+                    self.files.extend(glob(os.path.join(root, "**", ext), recursive=True))
+                
+                # Sort to ensure consistent order across runs
+                self.files.sort()
+                
+                print(f"Found {len(self.files)} images in {root}")
+                if len(self.files) == 0:
+                    raise FileNotFoundError(f"No images found in {root}. Check your path!")
+                    
                 self.transform = transform
-            def __len__(self): return len(self.files)
+
+            def __len__(self):
+                return len(self.files)
+
             def __getitem__(self, idx):
+                # Now we are guaranteed to open a file, not a folder
                 img = Image.open(self.files[idx]).convert('RGB')
                 if self.transform:
                     img = self.transform(img)
-                return img, 0 # Dummy label
+                return img, 0
 
         train_dataset = FlatFolderDataset(traindir, transform=SSLTransform(size=96))
         
