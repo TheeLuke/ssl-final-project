@@ -58,19 +58,19 @@ def get_dataloaders(dataset_name='cifar10', batch_size=256, num_workers=4):
         
         # 1. Pretraining Set (Unlabeled / Labels ignored)
         train_dataset = datasets.CIFAR10(
-            root='./data', train=True, download=True, 
+            root='/data', train=True, download=True, 
             transform=SSLTransform(size=96)
         )
         
         # 2. Memory Bank Set (Train images, no augmentation)
         memory_dataset = datasets.CIFAR10(
-            root='./data', train=True, download=True, 
+            root='/data', train=True, download=True, 
             transform=get_eval_transform(size=96)
         )
         
         # 3. Test Set (Test images)
         test_dataset = datasets.CIFAR10(
-            root='./data', train=False, download=True, 
+            root='/data', train=False, download=True, 
             transform=get_eval_transform(size=96)
         )
 
@@ -80,7 +80,7 @@ def get_dataloaders(dataset_name='cifar10', batch_size=256, num_workers=4):
         
         # Path to where you unzipped the images
         # Ensure this path matches where you ran the unzip command
-        traindir = './data/cc3m_all' 
+        traindir = '../data/cc3m_all' 
         
         if not os.path.exists(traindir):
             raise FileNotFoundError(f"Cannot find training data at {traindir}")
