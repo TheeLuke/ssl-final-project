@@ -1,139 +1,200 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
 import argparse
 import os
-from tqdm import tqdm
+import sys
+import datetime
+import time
+import math
+import json
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.backends.cudnn as cudnn
 
 # Import our custom modules
-from data import get_dataloaders
-from model import get_model
+import utils
+from models import get_vit_small_dino
+from loss import DINOLoss
+from dataset import load_combined_dataset
 
-
-# The SimCLR Loss Function (NT-Xent)
-class NTXentLoss(nn.Module):
-    """
-    Normalized Temperature-scaled Cross Entropy Loss.
-    """
-    def __init__(self, temperature=0.5):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, z_i, z_j):
-        batch_size = z_i.shape[0]
-        
-        # Concatenate both views: [2*B, Dim]
-        z = torch.cat([z_i, z_j], dim=0)
-        
-        # Normalize the vectors (critical for contrastive learning)
-        z = F.normalize(z, dim=1)
-        
-        # Compute similarity matrix (Cosine Similarity)
-        # sim[a, b] = z[a] dot z[b]
-        similarity_matrix = torch.matmul(z, z.T) / self.temperature
-        
-        # Create labels: The positive pair for i is (i + batch_size)
-        # maximize diagonal offsets
-        labels = torch.cat([
-            torch.arange(batch_size, 2 * batch_size),
-            torch.arange(0, batch_size)
-        ], dim=0).to(z.device)
-        
-        # Mask out self-similarity (similarity of image with itself)
-        mask = torch.eye(labels.shape[0], dtype=torch.bool).to(z.device)
-        similarity_matrix = similarity_matrix.masked_fill(mask, float('-inf'))
-        
-        # Compute Cross Entropy
-        loss = F.cross_entropy(similarity_matrix, labels)
-        return loss
-
-
-#Training Loop
-def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on: {device}")
+def get_args_parser():
+    parser = argparse.ArgumentParser('DINO training script', add_help=False)
     
-    #Load Data
-    # Use 'project_data' for the 500k images, 'cifar10' for sanity check
-    train_loader, _, _ = get_dataloaders(
-        dataset_name=args.dataset, 
-        batch_size=args.batch_size, 
-        num_workers=4
+    # Model parameters
+    parser.add_argument('--patch_size', default=8, type=int, help='Patch resolution of the model.')
+    parser.add_argument('--out_dim', default=65536, type=int, help='Dimensionality of the DINO head output.')
+    
+    # Training/Optimization parameters
+    parser.add_argument('--norm_last_layer', default=True, type=utils.bool_flag,
+        help="Whether or not to weight normalize the last layer of the DINO head.")
+    parser.add_argument('--momentum_teacher', default=0.996, type=float, help="Base EMA parameter for teacher update.")
+    parser.add_argument('--use_fp16', default=True, type=utils.bool_flag, help="Whether or not to use half precision for training")
+    parser.add_argument('--weight_decay', type=float, default=0.04, help="Initial weight decay.")
+    parser.add_argument('--weight_decay_end', type=float, default=0.4, help="Final weight decay.")
+    parser.add_argument('--clip_grad', type=float, default=3.0, help="Max gradient norm.")
+    parser.add_argument('--batch_size', default=64, type=int, help='Per-GPU batch-size.')
+    parser.add_argument('--epochs', default=200, type=int, help='Number of epochs of training.')
+    parser.add_argument('--freeze_last_layer', default=1, type=int, help="Number of epochs to freeze last layer.")
+    parser.add_argument('--lr', default=0.0005, type=float, help="Base learning rate.")
+    parser.add_argument('--warmup_epochs', default=10, type=int, help="Number of warmup epochs.")
+    
+    # Data parameters
+    parser.add_argument('--data_path_provided', default='./pretrain', type=str)
+    parser.add_argument('--data_path_external', default='./external_data', type=str)
+    parser.add_argument('--output_dir', default='./output_dir', type=str, help='Path to save logs and checkpoints.')
+    parser.add_argument('--num_workers', default=4, type=int, help='Number of data loading workers per GPU.')
+    
+    return parser
+
+def train_dino(args):
+    # 1. Prepare Output Directory
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # 2. Prepare Data
+    print(f"Loading data...")
+    dataset = load_combined_dataset(args.data_path_provided, args.data_path_external)
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+        shuffle=True
     )
     
-    #Initialize Model
-    model = get_model(args.arch).to(device)
+    # 3. Build Student and Teacher Networks
+    print(f"Creating model with patch size {args.patch_size}...")
+    student = get_vit_small_dino(patch_size=args.patch_size, out_dim=args.out_dim)
+    teacher = get_vit_small_dino(patch_size=args.patch_size, out_dim=args.out_dim)
     
-    #Setup Optimizer & Loss
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    criterion = NTXentLoss(temperature=args.temperature)
+    # Move to GPU
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    student, teacher = student.to(device), teacher.to(device)
+
+    # Teacher and student start with same weights
+    teacher.load_state_dict(student.state_dict())
     
-    # Scheduler: Cosine Decay is standard for SSL
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.1
+    # Turn off gradients for teacher
+    for p in teacher.parameters():
+        p.requires_grad = False
+        
+    # 4. Loss
+    dino_loss = DINOLoss(
+        out_dim=args.out_dim,
+        nepochs=args.epochs,
+    ).to(device)
+
+    # 5. Optimizer
+    params_groups = utils.get_params_groups(student) # You might need to add this helper to utils.py or just use standard param groups
+    # Standard AdamW param groups setup:
+    param_groups = [
+        {'params': [p for n, p in student.named_parameters() if ('bias' not in n and 'norm' not in n)], 'weight_decay': args.weight_decay},
+        {'params': [p for n, p in student.named_parameters() if ('bias' in n or 'norm' in n)], 'weight_decay': 0.0}
+    ]
+    
+    optimizer = torch.optim.AdamW(param_groups)
+
+    # 6. Schedulers
+    # Learning rate schedule
+    lr_schedule = utils.cosine_scheduler(
+        args.lr * (args.batch_size / 256.),  # Linear scaling rule
+        1e-6,
+        args.epochs, len(data_loader),
+        warmup_epochs=args.warmup_epochs,
     )
     
-    #Mixed Precision Scaler
-    scaler = GradScaler()
+    # Weight decay schedule
+    wd_schedule = utils.cosine_scheduler(
+        args.weight_decay,
+        args.weight_decay_end,
+        args.epochs, len(data_loader),
+    )
     
-    print(f"Starting training for {args.epochs} epochs...")
-    model.train()
-    
-    for epoch in range(1, args.epochs + 1):
-        total_loss = 0
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
+    # Momentum schedule (start at 0.996, go to 1.0)
+    momentum_schedule = utils.cosine_scheduler(args.momentum_teacher, 1, args.epochs, len(data_loader))
+
+    print(f"Starting training for {args.epochs} epochs")
+    start_time = time.time()
+
+    for epoch in range(args.epochs):
+        # Training One Epoch
+        metric_logger = utils.AverageMeter()
+        student.train()
         
-        for batch_idx, (images, _) in enumerate(progress_bar):
-            # images is a list: [view1, view2]
-            x1, x2 = images[0].to(device), images[1].to(device)
+        # Loop over batches
+        for it, (images, _) in enumerate(data_loader):
+            # images is a list of tensors (crops)
+            # Move all crops to GPU
+            images = [im.to(device, non_blocking=True) for im in images]
             
+            # Step-based scheduling
+            it_schedule = it + len(data_loader) * epoch
+            cur_lr = lr_schedule[it_schedule]
+            cur_wd = wd_schedule[it_schedule]
+            cur_mom = momentum_schedule[it_schedule]
+            
+            # Update optimizer learning rate and weight decay
+            for i, param_group in enumerate(optimizer.param_groups):
+                param_group['lr'] = cur_lr
+                if i == 0: # Only apply weight decay to first group
+                    param_group['weight_decay'] = cur_wd
+
+            # Forward pass
+            with torch.cuda.amp.autocast(enabled=args.use_fp16):
+                # Student forward (all crops)
+                student_output = student(images) 
+                # Teacher forward (global crops only - first 2)
+                teacher_output = teacher(images[:2])
+                
+                loss = dino_loss(student_output, teacher_output, epoch)
+
+            if not math.isfinite(loss.item()):
+                print(f"Loss is {loss.item()}, stopping training")
+                sys.exit(1)
+
+            # Backprop
             optimizer.zero_grad()
             
-            # Autocast for Mixed Precision (Faster)
-            with autocast():
-                # Forward pass
-                # We only need the projection 'z' for the loss
-                _, z1 = model(x1)
-                _, z2 = model(x2)
-                
-                loss = criterion(z1, z2)
+            # Scale loss if using FP16 (Standard PyTorch scaler recommended)
+            # For simplicity here:
+            loss.backward()
             
-            # Backward pass with Scaler
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            # Clip gradients
+            utils.clip_gradients(student, args.clip_grad)
             
-            total_loss += loss.item()
+            # Cancel gradients for last layer in first epoch
+            utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
             
-            # Update progress bar
-            progress_bar.set_postfix(loss=loss.item())
+            optimizer.step()
+
+            # Teacher EMA Update
+            with torch.no_grad():
+                for param_q, param_k in zip(student.parameters(), teacher.parameters()):
+                    param_k.data.mul_(cur_mom).add_((1 - cur_mom) * param_q.detach().data)
+
+            # Logging
+            if it % 10 == 0:
+                print(f"Epoch: [{epoch}/{args.epochs}] Step: [{it}/{len(data_loader)}] "
+                      f"Loss: {loss.item():.4f} LR: {cur_lr:.6f}")
+
+        # Save Checkpoint
+        save_dict = {
+            'student': student.state_dict(),
+            'teacher': teacher.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'epoch': epoch + 1,
+            'args': args,
+            'dino_loss': dino_loss.state_dict(),
+        }
+        utils.save_checkpoint(os.path.join(args.output_dir, f'checkpoint.pth'), save_dict)
         
-        scheduler.step()
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch} | Avg Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+        if epoch % 10 == 0:
+             utils.save_checkpoint(os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'), save_dict)
 
-        # Save every 5 epochs OR if it's the last epoch
-        if epoch % 5 == 0 or epoch == args.epochs:
-            os.makedirs("checkpoints", exist_ok=True)
-            save_path = f"checkpoints/ssl_{args.arch}_epoch_{epoch}.pth"
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
-            }, save_path)
-            print(f"Checkpoint saved to {save_path}")
+    total_time = time.time() - start_time
+    print(f"Training time: {str(datetime.timedelta(seconds=int(total_time)))}")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SSL Training Script")
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "project_data"], help="Dataset to use")
-    parser.add_argument("--arch", type=str, default="resnet18", help="Model backbone architecture")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--temperature", type=float, default=0.5, help="Temperature for NT-Xent loss")
-    
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser('DINO', parents=[get_args_parser()])
     args = parser.parse_args()
-    train(args)
+    train_dino(args)
