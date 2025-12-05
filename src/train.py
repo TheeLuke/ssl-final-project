@@ -40,9 +40,12 @@ def get_args_parser():
     
     # Data parameters
     parser.add_argument('--data_path_provided', default='./pretrain', type=str)
-    parser.add_argument('--data_path_external', default='./external_data', type=str)
+    parser.add_argument('--data_path_external', default='./external_data_final', type=str)
     parser.add_argument('--output_dir', default='./output_dir', type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--num_workers', default=4, type=int, help='Number of data loading workers per GPU.')
+    
+    # Resume argument
+    parser.add_argument('--resume_path', default='', type=str, help='Path to checkpoint to resume from.')
     
     return parser
 
@@ -53,13 +56,19 @@ def train_dino(args):
     # 2. Prepare Data
     print(f"Loading data...")
     dataset = load_combined_dataset(args.data_path_provided, args.data_path_external)
+    
+    # --- FIX IS HERE: Dynamic persistent_workers ---
+    # Only enable persistent_workers if num_workers > 0
+    use_persistent_workers = (args.num_workers > 0)
+    
     data_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=False,
         drop_last=True,
-        shuffle=True
+        shuffle=True,
+        persistent_workers=use_persistent_workers 
     )
     
     # 3. Build Student and Teacher Networks
@@ -85,46 +94,50 @@ def train_dino(args):
     ).to(device)
 
     # 5. Optimizer
-    params_groups = utils.get_params_groups(student) # You might need to add this helper to utils.py or just use standard param groups
-    # Standard AdamW param groups setup:
-    param_groups = [
-        {'params': [p for n, p in student.named_parameters() if ('bias' not in n and 'norm' not in n)], 'weight_decay': args.weight_decay},
-        {'params': [p for n, p in student.named_parameters() if ('bias' in n or 'norm' in n)], 'weight_decay': 0.0}
-    ]
-    
+    param_groups = utils.get_params_groups(student)
+    param_groups[0]['weight_decay'] = args.weight_decay
     optimizer = torch.optim.AdamW(param_groups)
 
     # 6. Schedulers
-    # Learning rate schedule
     lr_schedule = utils.cosine_scheduler(
-        args.lr * (args.batch_size / 256.),  # Linear scaling rule
+        args.lr * (args.batch_size / 256.),
         1e-6,
         args.epochs, len(data_loader),
         warmup_epochs=args.warmup_epochs,
     )
-    
-    # Weight decay schedule
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay,
         args.weight_decay_end,
         args.epochs, len(data_loader),
     )
-    
-    # Momentum schedule (start at 0.996, go to 1.0)
     momentum_schedule = utils.cosine_scheduler(args.momentum_teacher, 1, args.epochs, len(data_loader))
 
-    print(f"Starting training for {args.epochs} epochs")
+    # --- RESUME LOGIC ---
+    start_epoch = 0
+    if args.resume_path and os.path.isfile(args.resume_path):
+        print(f"Resuming from {args.resume_path}")
+        to_restore = {'epoch': 0}
+        utils.restart_from_checkpoint(
+            args.resume_path,
+            run_variables=to_restore,
+            student=student,
+            teacher=teacher,
+            optimizer=optimizer,
+            dino_loss=dino_loss,
+        )
+        start_epoch = to_restore['epoch']
+    # -------------------------
+
+    print(f"Starting training from epoch {start_epoch} for {args.epochs} epochs")
     start_time = time.time()
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         # Training One Epoch
-        metric_logger = utils.AverageMeter()
         student.train()
         
         # Loop over batches
         for it, (images, _) in enumerate(data_loader):
             # images is a list of tensors (crops)
-            # Move all crops to GPU
             images = [im.to(device, non_blocking=True) for im in images]
             
             # Step-based scheduling
@@ -133,19 +146,15 @@ def train_dino(args):
             cur_wd = wd_schedule[it_schedule]
             cur_mom = momentum_schedule[it_schedule]
             
-            # Update optimizer learning rate and weight decay
             for i, param_group in enumerate(optimizer.param_groups):
                 param_group['lr'] = cur_lr
-                if i == 0: # Only apply weight decay to first group
+                if i == 0: 
                     param_group['weight_decay'] = cur_wd
 
             # Forward pass
-            with torch.cuda.amp.autocast(enabled=args.use_fp16):
-                # Student forward (all crops)
+            with torch.amp.autocast('cuda', enabled=args.use_fp16):
                 student_output = student(images) 
-                # Teacher forward (global crops only - first 2)
                 teacher_output = teacher(images[:2])
-                
                 loss = dino_loss(student_output, teacher_output, epoch)
 
             if not math.isfinite(loss.item()):
@@ -154,17 +163,9 @@ def train_dino(args):
 
             # Backprop
             optimizer.zero_grad()
-            
-            # Scale loss if using FP16 (Standard PyTorch scaler recommended)
-            # For simplicity here:
             loss.backward()
-            
-            # Clip gradients
             utils.clip_gradients(student, args.clip_grad)
-            
-            # Cancel gradients for last layer in first epoch
             utils.cancel_gradients_last_layer(epoch, student, args.freeze_last_layer)
-            
             optimizer.step()
 
             # Teacher EMA Update
@@ -187,7 +188,6 @@ def train_dino(args):
             'dino_loss': dino_loss.state_dict(),
         }
         utils.save_checkpoint(os.path.join(args.output_dir, f'checkpoint.pth'), save_dict)
-        
         if epoch % 10 == 0:
              utils.save_checkpoint(os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'), save_dict)
 

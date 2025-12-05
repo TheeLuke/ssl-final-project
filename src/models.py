@@ -2,9 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
-
-# We rely on timm for the robust ViT implementation
-# pip install timm
 import timm
 from timm.models.vision_transformer import VisionTransformer
 
@@ -13,8 +10,6 @@ class DINOHead(nn.Module):
                  nlayers=3, hidden_dim=2048, bottleneck_dim=256):
         """
         The projection head used in DINO.
-        It projects the backbone features (384 dim) into a higher dim space
-        where the clustering/prototype matching happens.
         """
         super().__init__()
         nlayers = max(nlayers, 1)
@@ -36,8 +31,6 @@ class DINOHead(nn.Module):
         self.apply(self._init_weights)
         
         # The last layer is the "Prototype" layer.
-        # It maps the bottleneck features to the number of "classes" (out_dim).
-        # In DINO, out_dim is usually large (e.g. 65536) to allow for many clusters.
         self.last_layer = nn.utils.weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
         
         # Fix the magnitude of the last layer to 1. This stabilizes training.
@@ -60,8 +53,7 @@ class DINOHead(nn.Module):
 class MultiCropWrapper(nn.Module):
     """
     A wrapper that handles the "list of crops" logic.
-    Instead of passing 1 tensor, the dataloader returns a list of tensors 
-    (2 global + 6 local). This wrapper concatenates them for efficiency.
+    Since all crops are 96x96, we can simply concatenate them.
     """
     def __init__(self, backbone, head):
         super(MultiCropWrapper, self).__init__()
@@ -71,35 +63,26 @@ class MultiCropWrapper(nn.Module):
     def forward(self, x):
         # x is a list of tensors (e.g., [global_1, global_2, local_1, ...])
         
-        # Optimization: We want to run the backbone on all crops in parallel 
-        # if they have the same resolution.
-        # Since we resized ALL crops to 96x96 in dataset.py, we can 
-        # concatenate them all into one massive batch.
-        
         if isinstance(x, list):
-            # Concatenate along batch dimension
-            # Shape becomes: (Batch_Size * Num_Crops, 3, 96, 96)
-            idx_crops = torch.cumsum(torch.unique_tensor(
-                torch.tensor([inp.shape[0] for inp in x])
-            ), 0)
+            # Optimization: Concatenate everything into one massive batch
+            # Shape: (Batch_Size * Num_Crops, 3, 96, 96)
+            combined_input = torch.cat(x) 
             
-            start_idx = 0
-            for end_idx in idx_crops:
-                _ = self.backbone(torch.cat(x[start_idx: end_idx]))
-                start_idx = end_idx
+            # Forward pass through backbone
+            # We use forward_features to get the raw embeddings, not logits
+            features = self.backbone.forward_features(combined_input)
             
-            # Run backbone on the massive batch
-            combined_input = torch.cat(x)
-            
-            # Forward pass through ViT
-            # ViT output is (N, Dim) - usually the CLS token
-            features = self.backbone(combined_input)
+            # Handle timm output (take CLS token, index 0)
+            if features.ndim == 3:
+                features = features[:, 0]
             
             # Forward pass through DINO head
             return self.head(features)
         else:
             # Single tensor case (used during evaluation)
-            features = self.backbone(x)
+            features = self.backbone.forward_features(x)
+            if features.ndim == 3:
+                features = features[:, 0]
             return self.head(features)
 
 def get_vit_small_dino(patch_size=8, img_size=96, out_dim=65536):
@@ -107,7 +90,7 @@ def get_vit_small_dino(patch_size=8, img_size=96, out_dim=65536):
     Factory function to create the Student or Teacher model.
     """
     # 1. Instantiate ViT-Small
-    # We use 'vit_small_patch16_224' as a base but override critical params
+    # We use 'vit_small_patch16_224' architecture but override critical params
     model = VisionTransformer(
         img_size=img_size,
         patch_size=patch_size,  # CRITICAL: Set to 8 for 96px images
@@ -116,6 +99,7 @@ def get_vit_small_dino(patch_size=8, img_size=96, out_dim=65536):
         num_heads=6,
         mlp_ratio=4,
         qkv_bias=True,
+        num_classes=0,          # Crucial: Disable classifier head
         norm_layer=partial(nn.LayerNorm, eps=1e-6)
     )
     

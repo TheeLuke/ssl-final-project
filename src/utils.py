@@ -2,11 +2,40 @@ import os
 import torch
 import math
 import numpy as np
+import argparse
+
+def bool_flag(s):
+    """
+    Parse boolean arguments from the command line.
+    """
+    if isinstance(s, bool):
+        return s
+    if s.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif s.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+def get_params_groups(model):
+    """
+    Separates parameters into those that need weight decay and those that don't.
+    """
+    regularized = []
+    not_regularized = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # do not regularize biases nor Norm parameters
+        if name.endswith(".bias") or len(param.shape) == 1:
+            not_regularized.append(param)
+        else:
+            regularized.append(param)
+    return [{'params': regularized}, {'params': not_regularized, 'weight_decay': 0.}]
 
 def clip_gradients(model, clip):
     """
     Clips gradients of the model parameters.
-    Crucial for ViT stability to prevent exploding gradients.
     """
     norms = []
     for name, p in model.named_parameters():
@@ -20,8 +49,7 @@ def clip_gradients(model, clip):
 
 def cancel_gradients_last_layer(epoch, model, freeze_last_layer):
     """
-    In DINO, we freeze the last layer (prototypes) for the first epoch
-    to allow the backbone to stabilize before we start clustering.
+    Freeze last layer (prototypes) for the first few epochs.
     """
     if epoch >= freeze_last_layer:
         return
@@ -32,7 +60,6 @@ def cancel_gradients_last_layer(epoch, model, freeze_last_layer):
 def restart_from_checkpoint(ckpt_path, run_variables=None, **kwargs):
     """
     Re-loads weights from a checkpoint if it exists.
-    kwargs: models and optimizers to load.
     """
     if not os.path.isfile(ckpt_path):
         return
@@ -78,9 +105,6 @@ def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epoch
     return schedule
 
 def save_checkpoint(path, state):
-    """
-    Saves the training state safely.
-    """
     torch.save(state, path)
 
 class AverageMeter(object):
